@@ -4,22 +4,27 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/jfrazelle/tupperwarewithspears/ovs"
 	"github.com/samalba/dockerclient"
+	"github.com/vishvananda/netlink"
 )
 
 const (
-	VERSION = "v0.1.0"
-	BANNER  = ` _                
+	netnsPath = "/var/run/netns"
+	VERSION   = "v0.1.0"
+	BANNER    = ` _                
 | |___      _____ 
 | __\ \ /\ / / __|
 | |_ \ V  V /\__ \
@@ -33,7 +38,9 @@ const (
 )
 
 var (
-	dockerHost string
+	dockerHost  string
+	dockerPath  string
+	dockerImage = "jess/ab"
 
 	tlscert string
 	tlskey  string
@@ -55,6 +62,12 @@ var (
 	timelimit int
 	timeout   int
 	verbosity int
+
+	bridge  string
+	cidr    string
+	gateway string
+	ip      net.IP
+	ipNet   *net.IPNet
 
 	debug   bool
 	version bool
@@ -90,8 +103,11 @@ func init() {
 
 	flag.IntVar(&timelimit, "t", 0, "timelimit, implies a -n 50000 internally")
 	flag.IntVar(&timeout, "s", 30, "timeout, seconds to max. wait for each respone")
-
 	flag.IntVar(&verbosity, "v", 3, "verbosity, 4 -> headers, 3 -> response codes, 2 -> warnings/info")
+
+	flag.StringVar(&bridge, "bridge", "tws0", "bridge name")
+	flag.StringVar(&cidr, "cidr", "", "ip cidr to use for interface from containers")
+	flag.StringVar(&gateway, "gateway", "", "set gateway for outbound traffic")
 
 	flag.BoolVar(&debug, "d", false, "run in debug mode")
 	flag.BoolVar(&version, "version", false, "print version and exit")
@@ -128,10 +144,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	if (cidr != "" && gateway == "") || (cidr == "" && gateway != "") {
+		logrus.Infof("if you set a cidr you must also pass a gateway and vice vera, for default networking leave both empty")
+		flag.Usage()
+		os.Exit(1)
+	}
+
 	uri, err := url.ParseRequestURI(flag.Args()[0])
 	if err != nil {
 		logrus.Fatal(err)
-		return
+	}
+
+	// find docker in path
+	// TODO(jessfraz): this is nasty as fuck exec through the api
+	dockerPath, err = exec.LookPath("docker")
+	if err != nil {
+		logrus.Fatal("could not find docker in path")
 	}
 
 	// set up tls if passed
@@ -140,7 +168,6 @@ func main() {
 		tlsCert, err := tls.LoadX509KeyPair(tlscert, tlskey)
 		if err != nil {
 			logrus.Fatalf("Could not load X509 key pair: %v. Make sure the key is not encrypted", err)
-			return
 		}
 
 		tlsConfig = &tls.Config{
@@ -152,11 +179,41 @@ func main() {
 		}
 	}
 
+	if cidr != "" {
+		ip, ipNet, err = net.ParseCIDR(cidr)
+		if err != nil {
+			logrus.Fatalf("Parsing cidr (%s) failed: %v", cidr, err)
+		}
+
+		// check if the bridge exists
+		exists, err := ovs.BridgeExists(bridge)
+		if err != nil {
+			logrus.Fatal(err)
+		}
+
+		// create the bridge if it does not exist
+		if !exists {
+			if err := ovs.BridgeCreate(bridge); err != nil {
+				logrus.Fatal(err)
+			}
+		}
+
+		// create the netns dir
+		if err := os.MkdirAll(netnsPath, 0777); err != nil {
+			logrus.Fatalf("could not create dir %s: %v", netnsPath, err)
+		}
+	}
+
 	// init the docker client
 	docker, err := dockerclient.NewDockerClient(dockerHost, tlsConfig)
 	if err != nil {
 		logrus.Fatal(err)
-		return
+	}
+	// pull the image
+	args := []string{"pull", dockerImage}
+	output, err := exec.Command(dockerPath, args...).CombinedOutput()
+	if err != nil {
+		logrus.Fatalf("docker pull %s failed: %s (%s)", dockerImage, output, err)
 	}
 
 	// make sure we remove all containers on exit
@@ -199,6 +256,7 @@ func createTupperware(i int, uri *url.URL, docker *dockerclient.DockerClient) {
 
 	// create the command flags to pass to ab
 	cmd := []string{
+		"ab",
 		"-c",
 		strconv.Itoa(concurrency),
 		"-n",
@@ -245,8 +303,8 @@ func createTupperware(i int, uri *url.URL, docker *dockerclient.DockerClient) {
 
 	// create the container
 	containerConfig := &dockerclient.ContainerConfig{
-		Image: "jess/ab",
-		Cmd:   cmd,
+		Image:      "jess/ab",
+		Entrypoint: []string{"top"},
 	}
 	name := fmt.Sprintf("tws_%d", i)
 	id, err := docker.CreateContainer(containerConfig, name)
@@ -263,24 +321,96 @@ func createTupperware(i int, uri *url.URL, docker *dockerclient.DockerClient) {
 		return
 	}
 
-	// get container logs
-	logOptions := &dockerclient.LogOptions{
-		Follow:     true,
-		Stdout:     true,
-		Stderr:     true,
-		Timestamps: false,
+	// we have to start the container _before_ adding the new default gateway
+	// for outbound traffic, its unfortunate but yeah we need the pid of the process
+	if cidr != "" {
+
+		// get the pid of the container
+		info, err := docker.InspectContainer(id)
+		if err != nil {
+			logrus.Errorf("Error while inspecting container (%s): %v", name, err)
+			return
+		}
+		pid := info.State.Pid
+
+		nsPidPath := path.Join(netnsPath, strconv.Itoa(pid))
+		// defer removal of the pid from /var/run/netns
+		defer os.RemoveAll(nsPidPath)
+		// create a symlink from proc to the netns pid
+		procPidPath := path.Join("/proc", strconv.Itoa(pid), "ns", "net")
+		if err := os.Symlink(procPidPath, nsPidPath); err != nil {
+			logrus.Errorf("could not create symlink from %s to %s: %v", procPidPath, nsPidPath, err)
+		}
+
+		// create the veth pair and add to bridge
+		local, guest, err := ovs.CreateVethPair(bridge)
+		if err != nil {
+			logrus.Error(err)
+			return
+		}
+
+		// get the local link
+		localLink, err := netlink.LinkByName(local)
+		if err != nil {
+			logrus.Errorf("getting link by name %s failed: %v", local, err)
+			return
+		}
+		// set the local link as up
+		if netlink.LinkSetUp(localLink); err != nil {
+			logrus.Errorf("setting link name %s as up failed: %v", local, err)
+			return
+		}
+
+		// get the guest link and setns as container pid
+		guestLink, err := netlink.LinkByName(guest)
+		if err != nil {
+			logrus.Errorf("getting link by name %s failed: %v", guest, err)
+			return
+		}
+		if err := netlink.LinkSetNsPid(guestLink, pid); err != nil {
+			logrus.Errorf("setting link name %s to netns pid %d failed: %v", guest, pid, err)
+			return
+		}
+
+		// set the interface to eth1 in the container
+		ciface := "eth1"
+		if _, err := ovs.NetNSExec(pid, "ip", "link", "set", guest, "name", ciface); err != nil {
+			logrus.Error(err)
+			return
+		}
+
+		// add the ip to the interface
+		if _, err := ovs.NetNSExec(pid, "ip", "addr", "add", ip.String(), "dev", ciface); err != nil {
+			logrus.Error(err)
+			return
+		}
+
+		// delete the default route
+		if _, err := ovs.NetNSExec(pid, "ip", "route", "delete", "default"); err != nil {
+			logrus.Warn(err)
+		}
+		// setup the gateway
+		if _, err := ovs.NetNSExec(pid, "ip", "route", "get", gateway); err != nil {
+			// add it
+			if _, err := ovs.NetNSExec(pid, "ip", "route", "add", fmt.Sprintf("%s/32", gateway), "dev", ciface); err != nil {
+				logrus.Error(err)
+				return
+			}
+		}
+		// set gateway as default
+		if _, err := ovs.NetNSExec(pid, "ip", "route", "replace", "default", "via", gateway); err != nil {
+			logrus.Error(err)
+			return
+		}
 	}
-	logs, err := docker.ContainerLogs(id, logOptions)
+
+	// exec ab in the container
+	args := append([]string{"exec", id}, cmd...)
+	output, err := exec.Command(dockerPath, args...).CombinedOutput()
 	if err != nil {
-		logrus.Errorf("Error streaming container's logs (%s): %v", name, err)
+		logrus.Errorf("docker exec (%s) failed: %v: %s (%s)", id[0:7], strings.Join(args, " "), output, err)
 		return
 	}
 
-	// read the logs
-	body, err := ioutil.ReadAll(logs)
-	if err != nil {
-		logrus.Error("Error reading container's logs (%s): %v", name, err)
-		return
-	}
-	logrus.Infof("Logs for container (%s): %s", name, string(body))
+	logrus.Infof("Output from container (%s)\n %s", name, output)
 }

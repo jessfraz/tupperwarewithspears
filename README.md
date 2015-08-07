@@ -7,6 +7,11 @@ but this uses containers.
 Each container is run from a `jess/ab` image, which is just the apache
 benchmark utility.
 
+If you pass in a cidr with `-cidr` and gateway with `-gateway`, 
+containers will be given ips and have outbound traffic routed 
+via that IP. This uses openvswitch and a super gross 
+implementation of shelling out to `ovs-vsctl` & `ip netns exec`.
+
 **NOTE:** Do not use this for evil. Consider yourself warned.
 
 ```console
@@ -29,10 +34,13 @@ $ tws
   -H="": custom-header;custom-header
   -P="": proxy-auth-username:password
   -T="": content type
+  -bridge="tws0": bridge name
   -c=100: number of multiple requests to perform at a time. Default is one request at a time
+  -cidr="": ip cidr to use for interface from containers
   -d=false: run in debug mode
   -dockerHost="unix://var/run/docker.sock": docker daemon socket to connect to
   -f="ALL": specify SSL/TLS protocol (SSL2, SSL3, TLS1, or ALL)
+  -gateway="": set gateway for outbound traffic
   -m="GET": method
   -n=10000: number of requests to perform for the benchmarking session
   -nc=16: number of containers (tupperware) to attack with
@@ -42,6 +50,11 @@ $ tws
   -tlskey="": path to TLS key file
   -v=3: verbosity, 4 -> headers, 3 -> response codes, 2 -> warnings/info
   -version=false: print version and exit
+```
+
+Installing:
+```
+$ go get github.com/jfrazelle/tupperwarewithspears/cmd/tws
 ```
 
 Example:
