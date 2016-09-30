@@ -1,23 +1,23 @@
 # tupperwarewithspears
 
-Based off the awesome project 
-[beeswithmachineguns](https://github.com/newsapps/beeswithmachineguns), 
+Based off the awesome project
+[beeswithmachineguns](https://github.com/newsapps/beeswithmachineguns),
 but this uses containers.
 
 Each container is run from a `jess/ab` image, which is just the apache
 benchmark utility.
 
-If you pass in a cidr with `-cidr` and gateway with `-gateway`, 
-containers will be given ips and have outbound traffic routed 
-via that IP. This uses openvswitch and a super gross 
+If you pass in a cidr with `-cidr` and gateway with `-gateway`,
+containers will be given ips and have outbound traffic routed
+via that IP. This uses openvswitch and a super gross
 implementation of shelling out to `ovs-vsctl` & `ip netns exec`.
 
 **NOTE:** Do not use this for evil. Consider yourself warned.
 
 ```console
 $ tws
- _                
-| |___      _____ 
+ _
+| |___      _____
 | __\ \ /\ / / __|
 | |_ \ V  V /\__ \
  \__| \_/\_/ |___/
@@ -54,7 +54,7 @@ $ tws
 
 Installing:
 ```
-$ go get github.com/jfrazelle/tupperwarewithspears/cmd/tws
+$ go get github.com/jessfraz/tupperwarewithspears/cmd/tws
 ```
 
 Example:

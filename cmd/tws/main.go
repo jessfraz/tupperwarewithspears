@@ -16,7 +16,7 @@ import (
 	"syscall"
 
 	"github.com/Sirupsen/logrus"
-	"github.com/jfrazelle/tupperwarewithspears/ovs"
+	"github.com/jessfraz/tupperwarewithspears/ovs"
 	"github.com/samalba/dockerclient"
 	"github.com/vishvananda/netlink"
 )
@@ -24,8 +24,8 @@ import (
 const (
 	netnsPath = "/var/run/netns"
 	VERSION   = "v0.1.0"
-	BANNER    = ` _                
-| |___      _____ 
+	BANNER    = ` _
+| |___      _____
 | __\ \ /\ / / __|
 | |_ \ V  V /\__ \
  \__| \_/\_/ |___/
